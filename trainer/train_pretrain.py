@@ -127,8 +127,55 @@ if __name__ == "__main__":
         import swanlab as wandb
         wandb_id = ckp_data.get('wandb_id') if ckp_data else None
         resume = 'must' if wandb_id else None
-        wandb_run_name = f"MiniMind-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
-        wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
+        moe_experts = lm_config.num_experts if lm_config.use_moe else 0
+        moe_topk = lm_config.num_experts_per_tok if lm_config.use_moe else 0
+        # dataset 名字：取 data_path 的文件名（不含扩展名）
+        dataset_name = os.path.splitext(os.path.basename(args.data_path))[0]
+        # wandb run 名字处写入更多关键信息（层数/宽度/最大长度/MoE数&激活数/BS/梯度累积）
+        wandb_run_name = (
+            f"MiniMind-Pretrain-"
+            f"DS{dataset_name}-"
+            f"L{args.num_hidden_layers}-H{args.hidden_size}-S{args.max_seq_len}"
+            f"-MoE{moe_experts}K{moe_topk}-BS{args.batch_size}-GA{args.accumulation_steps}"
+            f"-LR{args.learning_rate}-Ep{args.epochs}"
+        )
+        wandb.init(
+            project=args.wandb_project,
+            name=wandb_run_name,
+            id=wandb_id,
+            resume=resume,
+        )
+        # 额外记录到 wandb config（便于筛选/对比）
+        if hasattr(wandb, 'config'):
+            wandb.config.update({
+                "data/name": dataset_name,
+                "data/path": args.data_path,
+                "model/num_hidden_layers": args.num_hidden_layers,
+                "model/hidden_size": args.hidden_size,
+                "data/max_seq_len": args.max_seq_len,
+                "moe/use_moe": bool(args.use_moe),
+                "moe/num_experts": moe_experts,
+                "moe/num_experts_per_tok": moe_topk,
+                "train/batch_size": args.batch_size,
+                "train/grad_accumulation_steps": args.accumulation_steps,
+            }, allow_val_change=True)
+        # 记录到 summary（静态信息，不进入 step 曲线）
+        try:
+            run = wandb.get_run() if hasattr(wandb, 'get_run') else getattr(wandb, 'run', None)
+            if run is not None and hasattr(run, 'summary'):
+                run.summary.update({
+                    "data/name": dataset_name,
+                    "data/path": args.data_path,
+                    "model/num_hidden_layers": args.num_hidden_layers,
+                    "model/hidden_size": args.hidden_size,
+                    "data/max_seq_len": args.max_seq_len,
+                    "moe/num_experts": moe_experts,
+                    "moe/num_experts_per_tok": moe_topk,
+                    "train/batch_size": args.batch_size,
+                    "train/grad_accumulation_steps": args.accumulation_steps,
+                })
+        except Exception:
+            pass
     
     # ========== 5. 定义模型、数据、优化器 ==========
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
