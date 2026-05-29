@@ -36,6 +36,37 @@ def get_model_params(model, config, log: bool = True):
     return float(total), float(active)
 
 
+def get_world_size() -> int:
+    return dist.get_world_size() if dist.is_initialized() else 1
+
+
+def estimate_train_flops(tokens: int, active_params_m: float, flops_per_param_token: float = 6.0) -> float:
+    """粗略估算训练 FLOPs。
+
+    常用近似：train_flops ≈ 6 * params * tokens
+    - params: 以 active_params 为准（MoE 使用激活参数量）
+    - tokens: 统计实际 forward 的 token 数（含 padding）
+
+    说明：这是近似值，主要用于把 W&B/SwanLab 横坐标切到 FLOPs。
+    """
+    return float(tokens) * float(active_params_m) * 1e6 * float(flops_per_param_token)
+
+
+def wandb_define_flops_xaxis(wandb, y_keys, x_key: str = "train/flops"):
+    """让曲线默认以 x_key 做横坐标。
+
+    兼容 wandb / swanlab：若不支持 define_metric 会静默跳过。
+    """
+    try:
+        if wandb is None or not hasattr(wandb, "define_metric"):
+            return
+        wandb.define_metric(x_key)
+        for y in y_keys:
+            wandb.define_metric(y, step_metric=x_key)
+    except Exception:
+        pass
+
+
 def is_main_process():
     return not dist.is_initialized() or dist.get_rank() == 0
 
@@ -45,8 +76,28 @@ def Logger(content):
         print(content)
 
 
-def get_lr(current_step, total_steps, lr):
-    return lr*(0.1 + 0.45*(1 + math.cos(math.pi * current_step / total_steps)))
+def get_lr(current_step, total_steps, lr, warmup_steps: int = 0):
+    """Cosine 学习率（带可选 warmup）。
+
+    - 原实现：lr * (0.1 + 0.45*(1 + cos(pi * step / total)))，step=0 时即为 lr（无 warmup）。
+    - 新实现：当 warmup_steps>0 时：
+      1) [0, warmup_steps) 线性从 0 -> lr
+      2) [warmup_steps, total_steps] 接原 cosine（从 lr 开始衰减）
+    """
+    # 防御：避免除零/非法
+    total_steps = max(int(total_steps), 1)
+    warmup_steps = max(int(warmup_steps), 0)
+    current_step = max(int(current_step), 0)
+
+    if warmup_steps > 0:
+        warmup_steps = min(warmup_steps, total_steps)
+        if current_step < warmup_steps:
+            return lr * (current_step / max(warmup_steps, 1))
+        # warmup 结束后，把 step 映射到 [0, total-warmup]
+        current_step = current_step - warmup_steps
+        total_steps = max(total_steps - warmup_steps, 1)
+
+    return lr * (0.1 + 0.45 * (1 + math.cos(math.pi * current_step / total_steps)))
 
 
 def init_distributed_mode():

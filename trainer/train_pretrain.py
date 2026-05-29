@@ -16,19 +16,42 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from model.model_minimind import MiniMindConfig
 from dataset.lm_dataset import PretrainDataset
-from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler, get_model_params
+from trainer.trainer_utils import (
+    get_lr,
+    Logger,
+    is_main_process,
+    lm_checkpoint,
+    init_distributed_mode,
+    setup_seed,
+    init_model,
+    SkipBatchSampler,
+    get_model_params,
+    get_world_size,
+    estimate_train_flops,
+    wandb_define_flops_xaxis,
+)
 
 warnings.filterwarnings('ignore')
 
 
-def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
+def train_epoch(epoch, loader, iters, start_step=0, wandb=None, perf_state=None, active_params_m: float = 0.0):
     start_time = time.time()
     last_step = start_step
+    if perf_state is None:
+        perf_state = {"tokens": 0, "flops": 0.0}
+    ws = get_world_size()
+    total_steps = args.epochs * iters
+    warmup_steps = int(args.warmup_ratio * total_steps) if getattr(args, 'warmup_ratio', 0) else 0
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
         input_ids = input_ids.to(args.device)
         labels = labels.to(args.device)
         last_step = step
-        lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
+
+        # 统计 tokens / FLOPs（按全局 world_size 计）
+        step_tokens = int(input_ids.numel()) * ws
+        perf_state["tokens"] += step_tokens
+        perf_state["flops"] += estimate_train_flops(step_tokens, active_params_m)
+        lr = get_lr(epoch * iters + step, total_steps, args.learning_rate, warmup_steps=warmup_steps)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
@@ -57,7 +80,19 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             eta_min = spend_time / max(step - start_step, 1) * (iters - step) // 60
             Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min')
             if wandb:
-                log_data = {"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min}
+                log_data = {
+                    "loss": current_loss,
+                    "logits_loss": current_logits_loss,
+                    "aux_loss": current_aux_loss,
+                    # 同一份数值，再额外 log 一组 *_flops 指标，用于画 FLOPs 横坐标曲线
+                    "loss_flops": current_loss,
+                    "logits_loss_flops": current_logits_loss,
+                    "aux_loss_flops": current_aux_loss,
+                    "learning_rate": current_lr,
+                    "epoch_time": eta_min,
+                    "train/tokens": perf_state["tokens"],
+                    "train/flops": perf_state["flops"],
+                }
                 # 记录 MoE 路由统计（负载均匀度/利用率等），仅在 log_interval 时写入
                 if lm_config.use_moe:
                     try:
@@ -91,7 +126,19 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             raw_model = getattr(raw_model, '_orig_mod', raw_model)
             state_dict = raw_model.state_dict()
             torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
-            lm_checkpoint(lm_config, weight=run_tag, model=model, optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints')
+            lm_checkpoint(
+                lm_config,
+                weight=run_tag,
+                model=model,
+                optimizer=optimizer,
+                scaler=scaler,
+                epoch=epoch,
+                step=step,
+                wandb=wandb,
+                save_dir='../checkpoints',
+                global_tokens=perf_state["tokens"],
+                global_flops=perf_state["flops"],
+            )
             model.train()
             del state_dict
 
@@ -112,6 +159,7 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=2, help="训练轮数")
     parser.add_argument("--batch_size", type=int, default=32, help="batch size")
     parser.add_argument("--learning_rate", type=float, default=5e-4, help="初始学习率")
+    parser.add_argument("--warmup_ratio", type=float, default=0.0, help="warmup比例（例如0.01表示前1%步数线性warmup到lr）")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
     parser.add_argument("--num_workers", type=int, default=8, help="数据加载线程数")
@@ -187,6 +235,10 @@ if __name__ == "__main__":
         resume = 'must' if wandb_id else None
         wandb.init(project=args.wandb_project, name=run_tag, id=wandb_id, resume=resume)
 
+        # 新增一组“以 FLOPs 为横坐标”的 loss 曲线（不影响原有 loss 以 step 为横坐标）
+        # 用单独的 key（*_flops），并把它们的 step_metric 绑定到 train/flops
+        wandb_define_flops_xaxis(wandb, y_keys=["loss_flops", "logits_loss_flops", "aux_loss_flops"], x_key="train/flops")
+
         # 额外记录到 wandb config（便于筛选/对比）
         if hasattr(wandb, 'config'):
             wandb.config.update({
@@ -230,12 +282,15 @@ if __name__ == "__main__":
     
     # ========== 7. 从ckp恢复状态 ==========
     start_epoch, start_step = 0, 0
+    perf_state = {"tokens": 0, "flops": 0.0}
     if ckp_data:
         model.load_state_dict(ckp_data['model'])
         optimizer.load_state_dict(ckp_data['optimizer'])
         scaler.load_state_dict(ckp_data['scaler'])
         start_epoch = ckp_data['epoch']
         start_step = ckp_data.get('step', 0)
+        perf_state["tokens"] = int(ckp_data.get("global_tokens", 0) or 0)
+        perf_state["flops"] = float(ckp_data.get("global_flops", 0.0) or 0.0)
     
     # ========== 8. 编译和分布式包装 ==========
     if args.use_compile == 1:
@@ -253,9 +308,9 @@ if __name__ == "__main__":
         loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
         if skip > 0: 
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
-            train_epoch(epoch, loader, len(loader) + skip, start_step, wandb)
+            train_epoch(epoch, loader, len(loader) + skip, start_step, wandb, perf_state=perf_state, active_params_m=active_params_m)
         else:
-            train_epoch(epoch, loader, len(loader), 0, wandb)
+            train_epoch(epoch, loader, len(loader), 0, wandb, perf_state=perf_state, active_params_m=active_params_m)
     
     # ========== 10. 清理分布进程 ==========
     if dist.is_initialized(): dist.destroy_process_group()
