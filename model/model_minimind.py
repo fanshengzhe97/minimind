@@ -169,10 +169,29 @@ class MOEFeedForward(nn.Module):
             elif self.training:
                 y[0, 0] += 0 * sum(p.sum() for p in expert.parameters())
         if self.training and self.config.router_aux_loss_coef > 0:
-            load = F.one_hot(topk_idx, self.config.num_experts).float().mean(0)
-            self.aux_loss = (load * scores.mean(0)).sum() * self.config.num_experts * self.config.router_aux_loss_coef
+            # 路由统计：负载/均匀度/利用率（用于 wandb 记录）
+            # topk_idx: [tokens, k]
+            load = F.one_hot(topk_idx, self.config.num_experts).float().mean(dim=(0, 1))  # [E]
+            prob_mean = scores.mean(0)  # [E]
+            eps = 1e-20
+            # 负载均匀度：归一化熵(0~1)，越大越均匀
+            load_entropy = -(load * (load + eps).log()).sum() / math.log(self.config.num_experts)
+            # 负载离散度：CV=std/mean，越小越均匀
+            load_cv = load.std() / (load.mean() + eps)
+            # 专家利用率：有 token 分配到的专家占比
+            utilization = (load > 0).float().mean()
+            self.last_router_stats = {
+                'load_entropy': load_entropy.detach(),
+                'load_cv': load_cv.detach(),
+                'utilization': utilization.detach(),
+                'max_load': load.max().detach(),
+                'min_load': load.min().detach(),
+            }
+
+            self.aux_loss = (load * prob_mean).sum() * self.config.num_experts * self.config.router_aux_loss_coef
         else:
             self.aux_loss = scores.new_zeros(1).squeeze()
+            self.last_router_stats = None
         return y.view(batch_size, seq_len, hidden_dim)
 
 class MiniMindBlock(nn.Module):

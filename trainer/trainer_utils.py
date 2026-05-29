@@ -15,7 +15,11 @@ from torch.utils.data import Sampler
 from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification
 from model.model_minimind import MiniMindForCausalLM
 
-def get_model_params(model, config):
+def get_model_params(model, config, log: bool = True):
+    """返回 (total_params_m, active_params_m)。
+
+    对 MoE：active_params 约等于 base + topk*expert_params（每 token 激活 topk 个专家）。
+    """
     total = sum(p.numel() for p in model.parameters()) / 1e6
     n_routed = getattr(config, 'n_routed_experts', getattr(config, 'num_experts', 0))
     n_active = getattr(config, 'num_experts_per_tok', 0)
@@ -24,8 +28,12 @@ def get_model_params(model, config):
     shared_expert = sum(p.numel() for n, p in model.named_parameters() if 'mlp.shared_experts.0.' in n) / 1e6
     base = total - (expert * n_routed) - (shared_expert * n_shared)
     active = base + (expert * n_active) + (shared_expert * n_shared)
-    if active < total: Logger(f'Model Params: {total:.2f}M-A{active:.2f}M')
-    else: Logger(f'Model Params: {total:.2f}M')
+    if log:
+        if active < total:
+            Logger(f'Model Params: {total:.2f}M-A{active:.2f}M')
+        else:
+            Logger(f'Model Params: {total:.2f}M')
+    return float(total), float(active)
 
 
 def is_main_process():
@@ -60,11 +68,25 @@ def setup_seed(seed: int):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+
+def _weight_file_path(save_dir: str, weight: str, lm_config, resume: bool = False) -> str:
+    """生成权重/断点文件路径。
+
+    兼容两种命名：
+    1) 旧命名：{weight}_{hidden_size}{_moe}.pth
+    2) 新命名（例如 wandb run name）：weight 已包含 H{hidden_size}/MoE 等信息时，不再追加后缀。
+    """
+    moe_path = '_moe' if lm_config.use_moe else ''
+    # 如果 weight 已经显式包含 hidden_size（如 ...-H768...），认为是“完整命名”，不再追加 _{hidden_size}{_moe}
+    has_hidden = (f'-H{lm_config.hidden_size}' in weight) or (f'H{lm_config.hidden_size}' in weight) or weight.endswith(str(lm_config.hidden_size))
+    suffix = '' if has_hidden else f'_{lm_config.hidden_size}{moe_path}'
+    base = f'{save_dir}/{weight}{suffix}'
+    return f'{base}_resume.pth' if resume else f'{base}.pth'
+
 def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoch=0, step=0, wandb=None, save_dir='../checkpoints', **kwargs):
     os.makedirs(save_dir, exist_ok=True)
-    moe_path = '_moe' if lm_config.use_moe else ''
-    ckp_path = f'{save_dir}/{weight}_{lm_config.hidden_size}{moe_path}.pth'
-    resume_path = f'{save_dir}/{weight}_{lm_config.hidden_size}{moe_path}_resume.pth'
+    ckp_path = _weight_file_path(save_dir, weight, lm_config, resume=False)
+    resume_path = _weight_file_path(save_dir, weight, lm_config, resume=True)
 
     if model is not None:
         raw_model = model.module if isinstance(model, DistributedDataParallel) else model
@@ -121,8 +143,7 @@ def init_model(lm_config, from_weight='pretrain', tokenizer_path='../model', sav
     model = MiniMindForCausalLM(lm_config)
 
     if from_weight!= 'none':
-        moe_suffix = '_moe' if lm_config.use_moe else ''
-        weight_path = f'{save_dir}/{from_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
+        weight_path = _weight_file_path(save_dir, from_weight, lm_config, resume=False)
         weights = torch.load(weight_path, map_location=device)
         model.load_state_dict(weights, strict=False)
 

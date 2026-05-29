@@ -16,7 +16,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from model.model_minimind import MiniMindConfig
 from dataset.lm_dataset import PretrainDataset
-from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
+from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler, get_model_params
 
 warnings.filterwarnings('ignore')
 
@@ -56,17 +56,42 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             current_lr = optimizer.param_groups[-1]['lr']
             eta_min = spend_time / max(step - start_step, 1) * (iters - step) // 60
             Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min')
-            if wandb: wandb.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
+            if wandb:
+                log_data = {"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min}
+                # 记录 MoE 路由统计（负载均匀度/利用率等），仅在 log_interval 时写入
+                if lm_config.use_moe:
+                    try:
+                        raw_model = model.module if isinstance(model, DistributedDataParallel) else model
+                        raw_model = getattr(raw_model, '_orig_mod', raw_model)
+                        layers = getattr(getattr(raw_model, 'model', None), 'layers', None)
+                        if layers is not None:
+                            stats = []
+                            for l in layers:
+                                s = getattr(getattr(l, 'mlp', None), 'last_router_stats', None)
+                                if s:
+                                    stats.append(s)
+                            if stats:
+                                # layer 平均
+                                def _mean(key: str):
+                                    vs = [float(x[key].detach().cpu()) for x in stats if key in x and x[key] is not None]
+                                    return sum(vs) / len(vs) if vs else None
+                                for k in ["load_entropy", "load_cv", "utilization", "max_load", "min_load"]:
+                                    v = _mean(k)
+                                    if v is not None:
+                                        log_data[f"moe/{k}"] = v
+                    except Exception:
+                        pass
+                wandb.log(log_data)
 
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()
-            moe_suffix = '_moe' if lm_config.use_moe else ''
-            ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
+            # ckpt 命名与 wandb run name 对齐
+            ckp = f'{args.save_dir}/{run_tag}.pth'
             raw_model = model.module if isinstance(model, DistributedDataParallel) else model
             raw_model = getattr(raw_model, '_orig_mod', raw_model)
             state_dict = raw_model.state_dict()
             torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
-            lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints')
+            lm_checkpoint(lm_config, weight=run_tag, model=model, optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints')
             model.train()
             del state_dict
 
@@ -114,37 +139,54 @@ if __name__ == "__main__":
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(args.save_dir, exist_ok=True)
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
-    ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
+
+    # 统一 run/ckpt 命名（与 wandb run name 对齐）
+    dataset_name = os.path.splitext(os.path.basename(args.data_path))[0]
+    moe_experts = lm_config.num_experts if lm_config.use_moe else 0
+    moe_topk = lm_config.num_experts_per_tok if lm_config.use_moe else 0
+    base_tag = (
+        f"MiniMind-Pretrain-"
+        f"DS{dataset_name}-"
+        f"L{args.num_hidden_layers}-H{args.hidden_size}-S{args.max_seq_len}"
+        f"-MoE{moe_experts}K{moe_topk}-BS{args.batch_size}-GA{args.accumulation_steps}"
+        f"-LR{args.learning_rate}-Ep{args.epochs}"
+    )
+
+    # run_tag 会在拿到 params/active_params 后补齐（并用于 wandb & ckpt 命名）
+    run_tag = base_tag
+
+    # 先不 init wandb；等模型初始化拿到 params/active_params 后再 init
+    ckp_data = None
     
     # ========== 3. 设置混合精度 ==========
     device_type = "cuda" if "cuda" in args.device else "cpu"
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
     autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
     
-    # ========== 4. 配wandb ==========
+    # ========== 4. 定义模型、数据、优化器 ==========
+    model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
+
+    # 计算参数量/激活参数量，并把它们编码到 run_tag/ckpt 命名里
+    total_params_m, active_params_m = get_model_params(model, lm_config, log=False)
+    fmt = lambda x: (f"{x:.1f}".replace('.', 'p'))
+    run_tag = f"{base_tag}-P{fmt(total_params_m)}M-A{fmt(active_params_m)}M"
+
+    # ========== 5. 检查/加载断点（使用最终 run_tag；并兼容旧命名） ==========
+    if args.from_resume == 1:
+        ckp_data = lm_checkpoint(lm_config, weight=run_tag, save_dir='../checkpoints')
+        if ckp_data is None:
+            ckp_data = lm_checkpoint(lm_config, weight=base_tag, save_dir='../checkpoints')
+        if ckp_data is None:
+            ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints')
+
+    # ========== 6. 配wandb（使用最终 run_tag） ==========
     wandb = None
     if args.use_wandb and is_main_process():
         import swanlab as wandb
         wandb_id = ckp_data.get('wandb_id') if ckp_data else None
         resume = 'must' if wandb_id else None
-        moe_experts = lm_config.num_experts if lm_config.use_moe else 0
-        moe_topk = lm_config.num_experts_per_tok if lm_config.use_moe else 0
-        # dataset 名字：取 data_path 的文件名（不含扩展名）
-        dataset_name = os.path.splitext(os.path.basename(args.data_path))[0]
-        # wandb run 名字处写入更多关键信息（层数/宽度/最大长度/MoE数&激活数/BS/梯度累积）
-        wandb_run_name = (
-            f"MiniMind-Pretrain-"
-            f"DS{dataset_name}-"
-            f"L{args.num_hidden_layers}-H{args.hidden_size}-S{args.max_seq_len}"
-            f"-MoE{moe_experts}K{moe_topk}-BS{args.batch_size}-GA{args.accumulation_steps}"
-            f"-LR{args.learning_rate}-Ep{args.epochs}"
-        )
-        wandb.init(
-            project=args.wandb_project,
-            name=wandb_run_name,
-            id=wandb_id,
-            resume=resume,
-        )
+        wandb.init(project=args.wandb_project, name=run_tag, id=wandb_id, resume=resume)
+
         # 额外记录到 wandb config（便于筛选/对比）
         if hasattr(wandb, 'config'):
             wandb.config.update({
@@ -152,6 +194,8 @@ if __name__ == "__main__":
                 "data/path": args.data_path,
                 "model/num_hidden_layers": args.num_hidden_layers,
                 "model/hidden_size": args.hidden_size,
+                "model/params_m": total_params_m,
+                "model/active_params_m": active_params_m,
                 "data/max_seq_len": args.max_seq_len,
                 "moe/use_moe": bool(args.use_moe),
                 "moe/num_experts": moe_experts,
@@ -159,6 +203,7 @@ if __name__ == "__main__":
                 "train/batch_size": args.batch_size,
                 "train/grad_accumulation_steps": args.accumulation_steps,
             }, allow_val_change=True)
+
         # 记录到 summary（静态信息，不进入 step 曲线）
         try:
             run = wandb.get_run() if hasattr(wandb, 'get_run') else getattr(wandb, 'run', None)
@@ -168,6 +213,8 @@ if __name__ == "__main__":
                     "data/path": args.data_path,
                     "model/num_hidden_layers": args.num_hidden_layers,
                     "model/hidden_size": args.hidden_size,
+                    "model/params_m": total_params_m,
+                    "model/active_params_m": active_params_m,
                     "data/max_seq_len": args.max_seq_len,
                     "moe/num_experts": moe_experts,
                     "moe/num_experts_per_tok": moe_topk,
@@ -176,15 +223,12 @@ if __name__ == "__main__":
                 })
         except Exception:
             pass
-    
-    # ========== 5. 定义模型、数据、优化器 ==========
-    model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
     
-    # ========== 6. 从ckp恢复状态 ==========
+    # ========== 7. 从ckp恢复状态 ==========
     start_epoch, start_step = 0, 0
     if ckp_data:
         model.load_state_dict(ckp_data['model'])
@@ -193,14 +237,14 @@ if __name__ == "__main__":
         start_epoch = ckp_data['epoch']
         start_step = ckp_data.get('step', 0)
     
-    # ========== 7. 编译和分布式包装 ==========
+    # ========== 8. 编译和分布式包装 ==========
     if args.use_compile == 1:
         model = torch.compile(model)
         Logger('torch.compile enabled')
     if dist.is_initialized():
         model = DistributedDataParallel(model, device_ids=[local_rank])
     
-    # ========== 8. 开始训练 ==========
+    # ========== 9. 开始训练 ==========
     for epoch in range(start_epoch, args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)
         setup_seed(42 + epoch); indices = torch.randperm(len(train_ds)).tolist()
@@ -213,5 +257,5 @@ if __name__ == "__main__":
         else:
             train_epoch(epoch, loader, len(loader), 0, wandb)
     
-    # ========== 9. 清理分布进程 ==========
+    # ========== 10. 清理分布进程 ==========
     if dist.is_initialized(): dist.destroy_process_group()
