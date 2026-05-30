@@ -7,3 +7,6 @@ docs-minimind/
 
 # datasets (often large / generated)
 dataset/
+
+# checkpoints (ckpt)
+checkpoints/
