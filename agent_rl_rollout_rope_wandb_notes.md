@@ -174,6 +174,81 @@ rollout 完后会把每条样本拼成：
 
 所以它不是逐轮打分（没有 per-turn reward），而是 **episode-level reward**（用整条轨迹的行为来打分）。
 
+### 7.1 Agent RL 阶段用了哪些 reward？怎么构造的？
+
+Agent RL 的 reward 计算函数是 `calculate_rewards()`（`trainer/train_agent.py:199-250`）。它对**每条多轮轨迹**输出一个标量 reward，并在最后做 `[-3, 3]` 裁剪。
+
+整体上可以理解为：
+
+> **规则形状奖励（格式/长度/工具合法性/完成度/重复惩罚） + 可验证目标（gt） +（可选）Reward Model 连续打分**
+
+下面按实现逻辑拆开说明（与代码保持一致）：
+
+#### 7.1.1 通用项：tool_call 标签闭合惩罚
+
+- 对每一轮文本 `turn` 统计 `<tool_call>` 与 `</tool_call>` 的数量差：
+  - 扣分：`reward -= 0.5 * sum(abs(turn.count('<tool_call>') - turn.count('</tool_call>')) for turn in turn_answers)`
+  - 见：`trainer/train_agent.py:211-213`
+
+目的：惩罚“标签不闭合/截断”的输出（这种输出通常会导致工具 JSON 无法解析或环境无法执行）。
+
+#### 7.1.2 分支 A：整条轨迹没有任何 tool call（tool-free）
+
+触发条件：`if not tool_calls:`（`trainer/train_agent.py:214-230`）。此时 reward 主要由 **长度/think 格式/RM/重复惩罚**组成：
+
+1) **长度分**：回复长度在 `[5, 800]` 之间 `+0.5`，否则 `-0.5`（`trainer/train_agent.py:215`）。
+
+2) **thinking 相关分（如果包含 `</think>`）**（`trainer/train_agent.py:216-220`）：
+
+- `think` 段长度在 `[20, 300]`：`+1.0`，否则 `-0.5`
+- `</think>` 只出现一次：`+0.25`，否则 `-0.25`
+
+3) **Reward Model 分（可选）**：若传入 `reward_model`，则：
+
+- `score = reward_model.get_score(messages, answer)`
+- `reward += score`
+- 见：`trainer/train_agent.py:221-227`
+
+4) **重复惩罚**：`reward -= rep_penalty(answer)`，其中 `rep_penalty` 是基于 token 3-gram 重复度的惩罚，最大上限 `0.5`（`trainer/train_agent.py:45-48,228`）。
+
+5) **总分裁剪**：`rewards[idx] = clip(reward, -3.0, 3.0)`（`trainer/train_agent.py:229`）。
+
+#### 7.1.3 分支 B：轨迹中出现 tool call（tool-using）
+
+触发条件：`else:`（`trainer/train_agent.py:231-249`）。此时 reward 主要由 **工具调用对齐/GT 命中/未完成惩罚/重复惩罚**组成：
+
+1) **工具合法性与“调用数量对齐”奖励**
+
+- 解析所有 turn 中的 `<tool_call>{...}</tool_call>` 得到 `tool_calls`（`trainer/train_agent.py:210-212`）。
+- 对每个 tool call 检查：
+  - tool 名是否在当前样本允许的 `tools` 白名单中
+  - 参数是否通过 `CHECK_ARGS` 校验（`trainer/train_agent.py:78-85,239-241`）
+- 合法调用计数 `valid_call_count` 之后，构造：
+
+  - `tool_gap = abs(valid_call_count - len(gt)) + max(0, len(tool_calls) - valid_call_count)`（`trainer/train_agent.py:241`）
+  - 若 `tool_gap == 0`：`+0.5`
+  - 否则：`-0.5 * tool_gap`
+  - 见：`trainer/train_agent.py:242-243`
+
+直观解释：既惩罚“调用了不该调用的工具/参数错”，也惩罚“该调用没调用/调用次数不匹配”。
+
+2) **GT 命中分（可验证奖励，RLVR 风格）**
+
+- 从最终答案 `final_text` 中做字符串/数值抽取匹配 `gt`（`validate_gt_in_text`，`trainer/train_agent.py:194-198,245-246`）。
+- 命中比例按 `len(verified) / len(gt)` 计，线性给分：
+  - `reward += 2.5 * len(verified) / len(gt)`（`trainer/train_agent.py:246`）
+
+3) **未完成惩罚**
+
+- 如果达到 `max_turns` 仍未结束（`unfinished=True`），扣 `0.5`：`reward -= 0.5`（`trainer/train_agent.py:247`）。
+
+4) **重复惩罚 + 总分裁剪**
+
+- `reward -= rep_penalty(final_text if final_text else answer)`（`trainer/train_agent.py:248`）
+- `clip(reward, -3.0, 3.0)`（`trainer/train_agent.py:249`）
+
+> 备注：在 tool-using 分支里，当前实现**不会额外叠加 RM 分数**；RM 只在 tool-free 分支使用（代码就是这么写的）。
+
 ---
 
 ## 8. train_agent 的 wandb/swanlab 打点说明（都代表啥）
