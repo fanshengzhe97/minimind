@@ -13,6 +13,7 @@ import random
 import signal
 import argparse
 import warnings
+from collections import Counter
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
@@ -24,7 +25,17 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from transformers import AutoTokenizer
 from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
 from dataset.lm_dataset import AgentRLDataset
-from trainer.trainer_utils import Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, SkipBatchSampler, init_model, LMForRewardModel
+from trainer.trainer_utils import (
+    Logger,
+    is_main_process,
+    lm_checkpoint,
+    init_distributed_mode,
+    setup_seed,
+    SkipBatchSampler,
+    init_model,
+    LMForRewardModel,
+    get_model_params,
+)
 from trainer.rollout_engine import create_rollout_engine, compute_per_token_logps
 
 warnings.filterwarnings('ignore')
@@ -238,6 +249,141 @@ def calculate_rewards(prompts, completions, gt_batch, tools_batch, num_gen, rewa
             rewards[idx] = max(min(reward, 3.0), -3.0)  # 总分Clip
     return rewards
 
+
+def _safe_quantile(x: torch.Tensor, q: float, default: float = 0.0) -> float:
+    """torch.quantile wrapper for empty tensors."""
+    if x is None:
+        return default
+    x = x.detach()
+    if x.numel() == 0:
+        return default
+    return torch.quantile(x.float(), q).item()
+
+
+def _masked_stats(x: torch.Tensor, mask: torch.Tensor):
+    """Return (mean, std, p95, max) over x[mask]."""
+    if x is None or mask is None:
+        return 0.0, 0.0, 0.0, 0.0
+    m = mask.bool()
+    if m.numel() == 0:
+        return 0.0, 0.0, 0.0, 0.0
+    v = x.detach()[m]
+    if v.numel() == 0:
+        return 0.0, 0.0, 0.0, 0.0
+    v = v.float()
+    return v.mean().item(), v.std(unbiased=False).item(), _safe_quantile(v, 0.95, 0.0), v.max().item()
+
+
+def _compute_tool_health_metrics(turn_outputs_batch, tools_batch, gt_batch, num_gen: int, unfinished_batch=None):
+    """Compute tool-call related health metrics for agent RL."""
+    total_samples = len(turn_outputs_batch) if turn_outputs_batch is not None else 0
+    total_calls = 0
+    tool_call_samples = 0
+    invalid_name_calls = 0
+    arg_invalid_calls = 0
+    valid_calls = 0
+    tool_gap_sum = 0.0
+    unfinished_cnt = 0
+    gt_hit_sum = 0.0
+    gt_hit_n = 0
+
+    name_counter = Counter()
+
+    if total_samples == 0:
+        return {
+            "tool_call_rate": 0.0,
+            "invalid_tool_call_rate": 0.0,
+            "arg_invalid_call_rate": 0.0,
+            "valid_call_rate": 0.0,
+            "tool_gap_mean": 0.0,
+            "unfinished_rate": 0.0,
+            "gt_hit_rate": 0.0,
+            "top_tool_counts": {},
+        }
+
+    for idx, turn_outputs in enumerate(turn_outputs_batch):
+        sample_idx = idx // num_gen if num_gen > 0 else 0
+        tools = tools_batch[sample_idx] if tools_batch is not None else None
+        gt = gt_batch[sample_idx] if gt_batch is not None else None
+        valid_names = {t["function"]["name"] for t in tools} if tools else set()
+
+        unfinished = bool(unfinished_batch[idx]) if unfinished_batch is not None else False
+        unfinished_cnt += int(unfinished)
+
+        # 与 calculate_rewards 保持一致：每 turn 取 </think> 之后的部分
+        turn_answers = [
+            (t.split("</think>", 1)[-1].strip() if "</think>" in t else t.strip())
+            for t in (turn_outputs or [])
+        ]
+        answer = turn_answers[-1] if turn_answers else ""
+
+        tool_calls = []
+        for t in turn_answers:
+            tool_calls.extend(parse_tool_calls(t))
+
+        if tool_calls:
+            tool_call_samples += 1
+
+        valid_call_count = 0
+        for call in tool_calls:
+            name = call.get("name", "")
+            raw = call.get("arguments", {})
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw)
+                except Exception:
+                    raw = {}
+
+            total_calls += 1
+            name_counter[name] += 1
+
+            if name not in valid_names:
+                invalid_name_calls += 1
+                continue
+
+            check = CHECK_ARGS.get(name)
+            if check is not None and check(raw):
+                valid_call_count += 1
+                valid_calls += 1
+            else:
+                arg_invalid_calls += 1
+
+        # tool_gap 定义与 reward 中一致
+        gt_len = len(gt) if gt else 0
+        tool_gap = abs(valid_call_count - gt_len) + max(0, len(tool_calls) - valid_call_count)
+        tool_gap_sum += float(tool_gap)
+
+        # gt_hit_rate：看最终答案里命中多少 gt
+        final_text = "" if unfinished else (answer.split("</tool_call>")[-1] if "</tool_call>" in answer else answer)
+        if gt:
+            verified = validate_gt_in_text(final_text, gt)
+            gt_hit_sum += (len(verified) / max(len(gt), 1))
+            gt_hit_n += 1
+
+    tool_call_rate = tool_call_samples / max(total_samples, 1)
+    invalid_tool_call_rate = invalid_name_calls / max(total_calls, 1)
+    arg_invalid_call_rate = arg_invalid_calls / max(total_calls, 1)
+    valid_call_rate = valid_calls / max(total_calls, 1)
+    tool_gap_mean = tool_gap_sum / max(total_samples, 1)
+    unfinished_rate = unfinished_cnt / max(total_samples, 1)
+    gt_hit_rate = gt_hit_sum / max(gt_hit_n, 1)
+
+    # 注意：swanlab 对 scalar chart 值类型要求较严格，string 作为 scalar 会报错。
+    # 因此这里不返回 top_tool_name 字段，只返回可数值化的 top_tool_counts，供外层展开成动态 key。
+    top3 = name_counter.most_common(3)
+    top_tool_counts = {name: int(cnt) for name, cnt in top3 if name}
+
+    return {
+        "tool_call_rate": tool_call_rate,
+        "invalid_tool_call_rate": invalid_tool_call_rate,
+        "arg_invalid_call_rate": arg_invalid_call_rate,
+        "valid_call_rate": valid_call_rate,
+        "tool_gap_mean": tool_gap_mean,
+        "unfinished_rate": unfinished_rate,
+        "gt_hit_rate": gt_hit_rate,
+        "top_tool_counts": top_tool_counts,
+    }
+
 # ================================ 工具与 Reward = End ================================
 def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model=None, start_step=0, wandb=None, use_sglang=False):
     last_step = start_step
@@ -346,17 +492,156 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
             lr = optimizer.param_groups[0]['lr']
             Logger(f'Epoch:[{epoch+1}/{args.epochs}]({step}/{iters}), Reward:{ar:.4f}, KL:{kl:.4f}, GrpStd:{gs:.4f}, AdvStd:{ast:.4f}, Loss:{pl:.4f}, AvgLen:{al:.2f}, AdvMean:{am:.4f}, LR:{lr:.8f}')
             if wandb and is_main_process():
-                wandb.log({"reward":ar,"kl_ref":kl,"group_reward_std":gs,"advantages_std":ast,"policy_loss":pl,"avg_response_len":al,"advantages_mean":am,"learning_rate":lr})
+                # ===== reward/len 分布 =====
+                r = rewards.detach()
+                r_std = r.std(unbiased=False).item()
+                r_p50 = _safe_quantile(r, 0.50, ar)
+                r_p90 = _safe_quantile(r, 0.90, ar)
+                r_min = r.min().item() if r.numel() else ar
+                r_max = r.max().item() if r.numel() else ar
+
+                lens = token_counts.detach().float()
+                len_p50 = _safe_quantile(lens, 0.50, al)
+                len_p90 = _safe_quantile(lens, 0.90, al)
+                len_max = lens.max().item() if lens.numel() else al
+                eos_rate = has_eos.float().mean().item() if has_eos is not None else 0.0
+
+                # ===== KL/ratio/clip 状态 =====
+                kl_div_tokens = (ref_per_token_logps - per_token_logps)
+                kl_div_mean, kl_div_std, kl_div_p95, kl_div_max = _masked_stats(kl_div_tokens, completion_mask)
+                ratio_mean, ratio_std, ratio_p95, ratio_max = _masked_stats(ratio, completion_mask)
+                per_token_kl_mean, _, per_token_kl_p95, per_token_kl_max = _masked_stats(per_token_kl, completion_mask)
+
+                masked = completion_mask.bool()
+                if masked.any():
+                    if args.loss_type == "cispo":
+                        clip_frac = (ratio.detach()[masked] > args.epsilon_high).float().mean().item()
+                    else:
+                        clip_frac = ((ratio.detach()[masked] < (1 - args.epsilon)) | (ratio.detach()[masked] > (1 + args.epsilon))).float().mean().item()
+                else:
+                    clip_frac = 0.0
+
+                # ===== 工具调用健康度 =====
+                tool_metrics = _compute_tool_health_metrics(
+                    turn_outputs_batch=turn_outputs_batch,
+                    tools_batch=tools_batch,
+                    gt_batch=gt_batch,
+                    num_gen=args.num_generations,
+                    unfinished_batch=unfinished_batch,
+                )
+
+                # ===== 数值健康：grad_norm / aux_loss / total_loss =====
+                with torch.no_grad():
+                    sq_sum = torch.tensor(0.0, device=args.device)
+                    for p in model.parameters():
+                        if p.grad is None:
+                            continue
+                        g = p.grad.detach()
+                        sq_sum += g.float().pow(2).sum()
+                    grad_norm = torch.sqrt(sq_sum).item()
+
+                total_loss = (policy_loss + aux_loss).detach().item() if isinstance(aux_loss, torch.Tensor) else pl
+                aux_loss_v = aux_loss.detach().item() if isinstance(aux_loss, torch.Tensor) else 0.0
+
+                wandb_payload = {
+                    # 原有
+                    "reward": ar,
+                    "kl_ref": kl,
+                    "group_reward_std": gs,
+                    "advantages_std": ast,
+                    "policy_loss": pl,
+                    "avg_response_len": al,
+                    "advantages_mean": am,
+                    "learning_rate": lr,
+
+                    # reward 分布
+                    "reward/std": r_std,
+                    "reward/p50": r_p50,
+                    "reward/p90": r_p90,
+                    "reward/min": r_min,
+                    "reward/max": r_max,
+
+                    # 长度与终止
+                    "len/p50": len_p50,
+                    "len/p90": len_p90,
+                    "len/max": len_max,
+                    "eos/rate": eos_rate,
+
+                    # KL/ratio
+                    "kl_div/mean": kl_div_mean,
+                    "kl_div/std": kl_div_std,
+                    "kl_div/p95": kl_div_p95,
+                    "kl_div/max": kl_div_max,
+                    "ratio/mean": ratio_mean,
+                    "ratio/std": ratio_std,
+                    "ratio/p95": ratio_p95,
+                    "ratio/max": ratio_max,
+                    "per_token_kl/mean": per_token_kl_mean,
+                    "per_token_kl/p95": per_token_kl_p95,
+                    "per_token_kl/max": per_token_kl_max,
+                    "clip/frac": clip_frac,
+
+                    # loss / grads
+                    "loss/total": total_loss,
+                    "loss/aux": aux_loss_v,
+                    "grad/norm": grad_norm,
+                }
+                # 工具相关指标（打平到 wandb）
+                for k, v in tool_metrics.items():
+                    if k == "top_tool_counts":
+                        continue
+                    wandb_payload[f"tools/{k}"] = v
+
+                # top 工具频次：展开成数值型动态 key，避免 string scalar 导致 swanlab 报错
+                top_tool_counts = tool_metrics.get("top_tool_counts", {}) or {}
+                for name, cnt in top_tool_counts.items():
+                    # 例：tools/top/calculate_math = 12
+                    wandb_payload[f"tools/top/{name}"] = float(cnt)
+
+                # 显存（仅 cuda）
+                if torch.cuda.is_available() and "cuda" in args.device:
+                    wandb_payload["cuda/mem_allocated_gb"] = torch.cuda.memory_allocated() / (1024 ** 3)
+                    wandb_payload["cuda/mem_reserved_gb"] = torch.cuda.memory_reserved() / (1024 ** 3)
+
+                # 样例抽样：每隔 save_interval（或最后一步）记录 best/worst
+                if (step % args.save_interval == 0) or (step == iters):
+                    best_idx = int(torch.argmax(r).item()) if r.numel() else 0
+                    worst_idx = int(torch.argmin(r).item()) if r.numel() else 0
+
+                    def _fmt_sample(idx_):
+                        si = idx_ // args.num_generations if args.num_generations > 0 else 0
+                        prompt_txt = prompts[si] if si < len(prompts) else ""
+                        comp_txt = completions[idx_] if idx_ < len(completions) else ""
+                        gt_ = gt_batch[si] if si < len(gt_batch) else None
+                        unfinished_ = bool(unfinished_batch[idx_]) if unfinished_batch is not None and idx_ < len(unfinished_batch) else False
+                        # 截断避免太大
+                        prompt_txt = prompt_txt[-1500:]
+                        comp_txt = comp_txt[-2000:]
+                        return (
+                            f"reward={r[idx_].item():.4f}, unfinished={unfinished_}\n"
+                            f"gt={gt_}\n"
+                            f"----- prompt (tail) -----\n{prompt_txt}\n"
+                            f"----- completion (tail) -----\n{comp_txt}"
+                        )
+
+                    wandb_payload["samples/best"] = _fmt_sample(best_idx)
+                    wandb_payload["samples/worst"] = _fmt_sample(worst_idx)
+
+                wandb.log(wandb_payload)
 
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()
-            moe_suffix = '_moe' if lm_config.use_moe else ''
-            ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
+            # ckpt 命名与 run_tag 对齐（与 pretrain/sft 一致）
+            ckp = f'{args.save_dir}/{run_tag}.pth'
             raw_model = model.module if isinstance(model, DistributedDataParallel) else model
             raw_model = getattr(raw_model, '_orig_mod', raw_model)
             state_dict = raw_model.state_dict()
             torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
-            lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer,
+            lm_checkpoint(
+                lm_config,
+                weight=run_tag,
+                model=model,
+                optimizer=optimizer,
                          epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints', scheduler=scheduler)
             model.train()
             del state_dict
@@ -389,6 +674,7 @@ if __name__ == "__main__":
     parser.add_argument('--num_hidden_layers', default=8, type=int, help="模型层数")
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE")
     parser.add_argument('--max_seq_len', default=1024, type=int, help="最大序列长度")
+    parser.add_argument('--inference_rope_scaling', default=0, type=int, choices=[0, 1], help="rollout/训练时启用YaRN RoPE外推（需policy/ref一致；仅解决位置编码问题）")
     parser.add_argument("--max_gen_len", type=int, default=768, help="单次最大生成长度")
     parser.add_argument("--max_total_len", type=int, default=2500, help="训练侧最终总长度上界")
     parser.add_argument("--data_path", type=str, default="../dataset/agent_rl.jsonl", help="训练数据路径")
@@ -417,22 +703,59 @@ if __name__ == "__main__":
     setup_seed(42 + (dist.get_rank() if dist.is_initialized() else 0))
 
     os.makedirs(args.save_dir, exist_ok=True)
-    lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers,
-                               max_seq_len=args.max_seq_len + args.max_gen_len, use_moe=bool(args.use_moe))
-    ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume == 1 else None
+    lm_config = MiniMindConfig(
+        hidden_size=args.hidden_size,
+        num_hidden_layers=args.num_hidden_layers,
+        max_seq_len=args.max_seq_len + args.max_gen_len,
+        use_moe=bool(args.use_moe),
+        inference_rope_scaling=bool(args.inference_rope_scaling),
+    )
+
+    # ========== run/ckpt 命名（与 pretrain/sft 类似，避免混淆） ==========
+    dataset_name = os.path.splitext(os.path.basename(args.data_path))[0]
+    moe_experts = lm_config.num_experts if lm_config.use_moe else 0
+    moe_topk = lm_config.num_experts_per_tok if lm_config.use_moe else 0
+    if args.save_weight != 'agent' and ('MiniMind-' in args.save_weight):
+        base_tag = args.save_weight
+        run_tag = base_tag
+    else:
+        base_tag = (
+            f"MiniMind-Agent-RL-"
+            f"DS{dataset_name}-"
+            f"L{args.num_hidden_layers}-H{args.hidden_size}-S{args.max_seq_len}+{args.max_gen_len}"
+            f"-MoE{moe_experts}K{moe_topk}-BS{args.batch_size}-GA{args.accumulation_steps}"
+            f"-LR{args.learning_rate}-Ep{args.epochs}-G{args.num_generations}"
+            f"-B{args.beta}-T{args.loss_type}"
+        )
+        run_tag = base_tag
+
+    # ========== 检查/加载断点（仅当 from_resume==1；兼容新/旧命名） ==========
+    ckp_data = None
+    if args.from_resume == 1:
+        # 优先按当前 run_tag 恢复（新命名）；找不到则回退到 base_tag / args.save_weight（兼容旧用法）
+        ckp_data = lm_checkpoint(lm_config, weight=run_tag, save_dir='../checkpoints')
+        if ckp_data is None:
+            ckp_data = lm_checkpoint(lm_config, weight=base_tag, save_dir='../checkpoints')
+        if ckp_data is None:
+            ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints')
 
     device_type = "cuda" if "cuda" in args.device else "cpu"
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
     autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
+
+    model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
+    # 补齐参数量到 run_tag
+    total_params_m, active_params_m = get_model_params(model, lm_config, log=False)
+    if run_tag == base_tag and not (args.save_weight != 'agent' and ('MiniMind-' in args.save_weight)):
+        fmt = lambda x: (f"{x:.1f}".replace('.', 'p'))
+        run_tag = f"{base_tag}-P{fmt(total_params_m)}M-A{fmt(active_params_m)}M"
 
     wandb = None
     if args.use_wandb and is_main_process():
         import swanlab as wandb
         wandb_id = ckp_data.get('wandb_id') if ckp_data else None
         resume = 'must' if wandb_id else None
-        wandb.init(project=args.wandb_project, name=f"Agent-RL-E{args.epochs}-B{args.batch_size}-LR{args.learning_rate}", id=wandb_id, resume=resume)
-
-    model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
+        wandb.init(project=args.wandb_project, name=run_tag, id=wandb_id, resume=resume)
 
     ref_model, _ = init_model(lm_config, args.from_weight, device=args.device)
     ref_model = ref_model.eval().requires_grad_(False)
