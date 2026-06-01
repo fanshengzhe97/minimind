@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import argparse
 
 __package__ = "scripts"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -13,7 +14,7 @@ from model.model_lora import apply_lora, merge_lora
 
 warnings.filterwarnings('ignore', category=UserWarning)
 
-def convert_torch2transformers_minimind(torch_path, transformers_path, dtype=torch.float16):
+def convert_torch2transformers_minimind(torch_path, transformers_path, tokenizer_path: str = '../model/', dtype=torch.float16):
     MiniMindConfig.register_for_auto_class()
     MiniMindForCausalLM.register_for_auto_class("AutoModelForCausalLM")
     lm_model = MiniMindForCausalLM(lm_config)
@@ -24,7 +25,7 @@ def convert_torch2transformers_minimind(torch_path, transformers_path, dtype=tor
     model_params = sum(p.numel() for p in lm_model.parameters() if p.requires_grad)
     print(f'模型参数: {model_params / 1e6} 百万 = {model_params / 1e9} B (Billion)')
     lm_model.save_pretrained(transformers_path, safe_serialization=False)
-    tokenizer = AutoTokenizer.from_pretrained('../model/')
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     tokenizer.save_pretrained(transformers_path)
     # ======= transformers-5.0的兼容低版本写法 =======
     if int(transformers.__version__.split('.')[0]) >= 5:
@@ -37,7 +38,7 @@ def convert_torch2transformers_minimind(torch_path, transformers_path, dtype=tor
 
 
 # QwenForCausalLM/LlamaForCausalLM结构兼容生态
-def convert_torch2transformers(torch_path, transformers_path, dtype=torch.float16):
+def convert_torch2transformers(torch_path, transformers_path, tokenizer_path: str = '../model/', dtype=torch.float16):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     state_dict = torch.load(torch_path, map_location=device)
     common_config = {
@@ -83,7 +84,7 @@ def convert_torch2transformers(torch_path, transformers_path, dtype=torch.float1
     qwen_model.save_pretrained(transformers_path)
     model_params = sum(p.numel() for p in qwen_model.parameters() if p.requires_grad)
     print(f'模型参数: {model_params / 1e6} 百万 = {model_params / 1e9} B (Billion)')
-    tokenizer = AutoTokenizer.from_pretrained('../model/')
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     tokenizer.save_pretrained(transformers_path)
 
     # ======= transformers-5.0的兼容低版本写法 =======
@@ -125,13 +126,39 @@ def convert_json_to_jinja(json_file_path, output_path):
     print(f"模板已保存为 jinja 文件: {output_path}")
 
 
-if __name__ == '__main__':
-    lm_config = MiniMindConfig(hidden_size=768, num_hidden_layers=8, max_seq_len=8192, use_moe=False)
+def parse_args():
+    p = argparse.ArgumentParser(description='Convert MiniMind .pth to Transformers directory')
+    p.add_argument('--torch_path', type=str, default='', help='PyTorch .pth 权重路径（默认按旧逻辑推导）')
+    p.add_argument('--transformers_path', type=str, default='', help='导出的 Transformers 模型目录（默认 ../minimind-3）')
+    p.add_argument('--tokenizer_path', type=str, default='../model/', help='tokenizer 目录（默认 ../model/）')
+    p.add_argument('--hidden_size', type=int, default=768)
+    p.add_argument('--num_hidden_layers', type=int, default=8)
+    p.add_argument('--max_seq_len', type=int, default=8192)
+    p.add_argument('--use_moe', type=int, default=0, choices=[0, 1])
+    p.add_argument('--arch', type=str, default='qwen_compatible', choices=['minimind', 'qwen_compatible'], help='导出结构：minimind(自定义) / qwen_compatible(Qwen3兼容)')
+    p.add_argument('--dtype', type=str, default='float16', choices=['float16', 'bfloat16'])
+    return p.parse_args()
 
-    # convert torch to transformers
-    torch_path = f"../out/full_sft_{lm_config.hidden_size}{'_moe' if lm_config.use_moe else ''}.pth"
-    transformers_path = '../minimind-3'
-    convert_torch2transformers(torch_path, transformers_path)
+
+if __name__ == '__main__':
+    args = parse_args()
+
+    lm_config = MiniMindConfig(
+        hidden_size=args.hidden_size,
+        num_hidden_layers=args.num_hidden_layers,
+        max_seq_len=args.max_seq_len,
+        use_moe=bool(args.use_moe),
+    )
+
+    # 兼容旧用法：不传 torch_path / transformers_path 时走原默认
+    torch_path = args.torch_path or f"../out/full_sft_{lm_config.hidden_size}{'_moe' if lm_config.use_moe else ''}.pth"
+    transformers_path = args.transformers_path or '../minimind-3'
+    dtype = torch.float16 if args.dtype == 'float16' else torch.bfloat16
+
+    if args.arch == 'minimind':
+        convert_torch2transformers_minimind(torch_path, transformers_path, tokenizer_path=args.tokenizer_path, dtype=dtype)
+    else:
+        convert_torch2transformers(torch_path, transformers_path, tokenizer_path=args.tokenizer_path, dtype=dtype)
 
     # # merge lora
     # base_torch_path = f"../out/full_sft_{lm_config.hidden_size}{'_moe' if lm_config.use_moe else ''}.pth"
