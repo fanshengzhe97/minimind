@@ -249,6 +249,31 @@ Agent RL 的 reward 计算函数是 `calculate_rewards()`（`trainer/train_agent
 
 > 备注：在 tool-using 分支里，当前实现**不会额外叠加 RM 分数**；RM 只在 tool-free 分支使用（代码就是这么写的）。
 
+#### 7.1.4 关于 `<think>` 与 tool call 的一个易踩坑点（重要）
+
+当前实现里：
+
+- **rollout 阶段**判断是否要执行工具：直接从模型输出 `new_text` 中解析 `<tool_call>...</tool_call>`（不区分是否在 `<think>` 内）。
+  - 见：`trainer/train_agent.py:143-155`
+- **reward 阶段**为了更稳定地做工具/答案解析，会先把每一轮输出按 `</think>` 切开，仅保留 `</think>` 后的部分作为 `turn_answers`，再从 `turn_answers` 里解析 tool call。
+  - 见：`trainer/train_agent.py:207-212`
+
+因此会出现“**rollout 侧执行了工具，但 reward 侧看不到 tool call**”的口径不一致风险，典型触发方式就是：
+
+- 把 `<tool_call>...</tool_call>` 放在 `<think>...</think>` 里面（reward 会把它切掉）。
+
+另外：即使 tool call 在 `</think>` 之后、reward 能正确识别为 tool-using 分支，当前 reward 设计也仍然是：
+
+- **tool-free 分支**才会给 `<think>` 的长度/闭合奖励（`trainer/train_agent.py:216-220`）
+- **tool-using 分支**不会计算 think 相关 reward（只看 tool 对齐/gt 命中/unfinished/重复惩罚等，`trainer/train_agent.py:231-249`）
+
+**推荐输出格式**（允许 think，但 tool_call 放在 `</think>` 之后）：
+
+```text
+<think>先调用工具拿到信息</think>
+<tool_call>{"name":"get_current_time","arguments":{"timezone":"Asia/Shanghai"}}</tool_call>
+```
+
 ---
 
 ## 8. train_agent 的 wandb/swanlab 打点说明（都代表啥）
