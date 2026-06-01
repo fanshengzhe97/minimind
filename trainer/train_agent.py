@@ -648,6 +648,11 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
 
         if step % args.save_interval == 0 or step == iters: rollout_engine.update_policy(model)
 
+        # DDP 对齐：保存仅主进程执行，但其它 rank 也必须等待，避免 rank 间步数/退出节奏不一致。
+        # 否则可能出现：rank0 已经保存并进入退出/销毁 PG，其它 rank 仍在 rollout/forward，导致 torchrun 残留。
+        if dist.is_initialized() and (step % args.save_interval == 0 or step == iters):
+            dist.barrier()
+
         del per_token_logps, ref_per_token_logps
         del completions, rewards, grouped_rewards, mean_r, std_r, advantages, completion_mask
 
@@ -810,4 +815,11 @@ if __name__ == "__main__":
         else:
             rl_train_epoch(epoch, loader, len(loader), rollout_engine, ref_model, reward_model, 0, wandb, use_sglang = (args.rollout_engine == "sglang"))
 
-    if dist.is_initialized(): dist.destroy_process_group()
+        # epoch 级别对齐：确保所有 rank 都结束 epoch，再进入下一轮/销毁进程组
+        if dist.is_initialized():
+            dist.barrier()
+
+    if dist.is_initialized():
+        # 再次对齐，避免有的 rank 先 destroy 导致其它 rank 后续 NCCL/barrier 异常
+        dist.barrier()
+        dist.destroy_process_group()
