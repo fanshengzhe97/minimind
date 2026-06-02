@@ -20,8 +20,10 @@ class LoRA(nn.Module):
 
 def apply_lora(model, rank=16):
     for name, module in model.named_modules():
-        if isinstance(module, nn.Linear) and module.weight.shape[0] == module.weight.shape[1]:
-            lora = LoRA(module.weight.shape[0], module.weight.shape[1], rank=rank).to(model.device)
+        if isinstance(module, nn.Linear):
+            in_features = module.weight.shape[1]
+            out_features = module.weight.shape[0]
+            lora = LoRA(in_features, out_features, rank=rank).to(model.device)
             setattr(module, "lora", lora)
             original_forward = module.forward
 
