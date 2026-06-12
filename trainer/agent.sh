@@ -20,7 +20,7 @@ ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-1}"
 LEARNING_RATE="${LEARNING_RATE:-3e-7}"
 NUM_GENERATIONS="${NUM_GENERATIONS:-4}"
 BETA="${BETA:-0.1}"
-LOSS_TYPE="${LOSS_TYPE:-cispo}"
+LOSS_TYPE="${LOSS_TYPE:-grpo}"
 EPSILON="${EPSILON:-0.2}"
 EPSILON_HIGH="${EPSILON_HIGH:-5.0}"
 FROM_RESUME="${FROM_RESUME:-0}"
@@ -28,6 +28,10 @@ FROM_RESUME="${FROM_RESUME:-0}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-1024}"
 MAX_GEN_LEN="${MAX_GEN_LEN:-768}"
 MAX_TOTAL_LEN="${MAX_TOTAL_LEN:-2500}"
+
+# YaRN RoPE 外推：0=关，1=开
+INFERENCE_ROPE_SCALING="${INFERENCE_ROPE_SCALING:-1}"
+YARN_TARGET_LEN="${YARN_TARGET_LEN:-5000}"
 
 # 结构参数：可以不填，让脚本从 MODEL_TAG 解析（后面会自动解析补齐）
 NUM_HIDDEN_LAYERS="${NUM_HIDDEN_LAYERS:-}"
@@ -100,6 +104,8 @@ torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" "${ROOT_DIR}/trainer/
   --max_seq_len="${MAX_SEQ_LEN}" \
   --max_gen_len="${MAX_GEN_LEN}" \
   --max_total_len="${MAX_TOTAL_LEN}" \
+  --inference_rope_scaling="${INFERENCE_ROPE_SCALING}" \
+  --yarn_target_len="${YARN_TARGET_LEN}" \
   --num_hidden_layers="${NUM_HIDDEN_LAYERS}" \
   --hidden_size="${HIDDEN_SIZE}" \
   --use_moe="${USE_MOE}" \
@@ -110,4 +116,3 @@ TORCHRUN_PID=$!
 echo "${TORCHRUN_PID}" >"${TORCHRUN_PIDFILE}"
 TORCHRUN_STARTED_BY_SCRIPT=1
 wait "${TORCHRUN_PID}"
-

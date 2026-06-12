@@ -28,15 +28,22 @@ class MiniMindConfig(PretrainedConfig):
         self.rms_norm_eps = kwargs.get("rms_norm_eps", 1e-6)
         self.rope_theta = kwargs.get("rope_theta", 1e6)
         self.tie_word_embeddings = kwargs.get("tie_word_embeddings", True)
+        # YaRN RoPE scaling (inference-time extrapolation)
+        # - allow user to override via `rope_scaling` in kwargs (Transformers-compatible)
+        # - otherwise, keep a conservative default when `inference_rope_scaling=True`
         self.inference_rope_scaling = kwargs.get("inference_rope_scaling", False)
-        self.rope_scaling = {
-            "beta_fast": 32,
-            "beta_slow": 1,
-            "factor": 16,
-            "original_max_position_embeddings": 2048,
-            "attention_factor": 1.0,
-            "type": "yarn"
-        } if self.inference_rope_scaling else None
+        rope_scaling_override = kwargs.get("rope_scaling", None)
+        if rope_scaling_override is not None:
+            self.rope_scaling = rope_scaling_override
+        else:
+            self.rope_scaling = {
+                "beta_fast": 32,
+                "beta_slow": 1,
+                "factor": 16,
+                "original_max_position_embeddings": 2048,
+                "attention_factor": 1.0,
+                "type": "yarn",
+            } if self.inference_rope_scaling else None
         ### MoE specific configs (ignored if use_moe = False)
         self.num_experts = kwargs.get("num_experts", 4)
         self.num_experts_per_tok = kwargs.get("num_experts_per_tok", 1)

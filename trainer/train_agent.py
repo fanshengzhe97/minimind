@@ -40,6 +40,27 @@ from trainer.rollout_engine import create_rollout_engine, compute_per_token_logp
 
 warnings.filterwarnings('ignore')
 
+
+def _parse_sft_seq_len_from_weight_name(weight_name: str):
+    """从 sft 阶段 weight 名称里解析长度信息。
+
+    约定：权重命名里包含 "-S{len}"（例如 MiniMind-Full-SFT-...-S768-...）。
+    agent RL 权重可能是 "-S{seq}+{gen}"，这里也兼容，取 seq 部分。
+    """
+    if not weight_name or not isinstance(weight_name, str):
+        return None
+    m = re.search(r"-S(\d+)(?:\+(\d+))?", weight_name)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
+
+
+# 与 trainer/train_full_sft.py 的默认 max_seq_len 保持一致：默认长度不进 tag
+SFT_DEFAULT_SEQ_LEN = 768
+
 # ================================ 工具与 Reward = Start ================================
 
 def rep_penalty(text, n=3, cap=0.5):
@@ -76,12 +97,14 @@ MOCK_RESULTS = {
 
 # ======== 参数校验 ========
 CHECK_ARGS = {
-    "calculate_math": lambda a: bool(a.get("expression")),
-    "unit_converter": lambda a: a.get("value") is not None and a.get("from_unit") and a.get("to_unit"),
-    "get_current_weather": lambda a: bool(a.get("location")),
+    # 注意：模型可能输出非法 arguments（非 dict / JSON 解析失败）。这里统一做类型保护，
+    # 让 reward 侧把它计为 invalid，而不是直接 crash。
+    "calculate_math": lambda a: isinstance(a, dict) and bool(a.get("expression")),
+    "unit_converter": lambda a: isinstance(a, dict) and a.get("value") is not None and a.get("from_unit") and a.get("to_unit"),
+    "get_current_weather": lambda a: isinstance(a, dict) and bool(a.get("location")),
     "get_current_time": lambda a: True,
-    "get_exchange_rate": lambda a: bool(a.get("from_currency")) and bool(a.get("to_currency")),
-    "translate_text": lambda a: bool(a.get("text")) and bool(a.get("target_language")),
+    "get_exchange_rate": lambda a: isinstance(a, dict) and bool(a.get("from_currency")) and bool(a.get("to_currency")),
+    "translate_text": lambda a: isinstance(a, dict) and bool(a.get("text")) and bool(a.get("target_language")),
 }
 
 # ======== 工具调用解析与执行 ========
@@ -197,9 +220,16 @@ def validate_gt_in_text(text, gt_list):
     return {g for g in gt_list if ((s := str(g).strip()) and s.lower() in text.lower()) or (re.fullmatch(r'[-+]?\d+(?:\.\d+)?', str(g).strip().replace(',', '')) and any(abs(float(str(g).strip().replace(',', '')) - n) < 1e-6 for n in nums))}
 
 def calculate_rewards(prompts, completions, gt_batch, tools_batch, num_gen, reward_model=None, device="cuda", turn_outputs_batch=None, unfinished_batch=None):
+    """Agent RL reward.
+
+    Returns:
+        rewards: 原始 reward（用于训练 loss）。
+        rewards_wo_len: 去掉显式“长度奖励”（response 长度分 + think 长度分）的 reward（仅用于监控/打点）。
+    """
     rewards = torch.zeros(len(completions), device=device)
+    rewards_wo_len = torch.zeros(len(completions), device=device)
     for idx, response in enumerate(completions):
-        reward, answer = 0.0, response
+        reward, len_reward, answer = 0.0, 0.0, response
         sample_idx = idx // num_gen
         tools = tools_batch[sample_idx]
         turn_outputs = turn_outputs_batch[idx] if turn_outputs_batch is not None else [response]
@@ -212,10 +242,16 @@ def calculate_rewards(prompts, completions, gt_batch, tools_batch, num_gen, rewa
         reward -= 0.5 * sum(abs(turn.count('<tool_call>') - turn.count('</tool_call>')) for turn in turn_answers)  # 标签扣分
         # -------- 无工具调用：格式+reward奖励 --------
         if not tool_calls:
-            reward += 0.5 if 5 <= len(response.strip()) <= 800 else -0.5  # 长度分
+            # 长度分（显式 length-based；wo_len 不包含）
+            s = 0.5 if 5 <= len(response.strip()) <= 800 else -0.5
+            reward += s
+            len_reward += s
             if '</think>' in response:
                 think, answer = response.split('</think>', 1)
-                reward += 1.0 if 20 <= len(think.strip()) <= 300 else -0.5  # 思考长度分
+                # 思考长度分（显式 length-based；wo_len 不包含）
+                s = 1.0 if 20 <= len(think.strip()) <= 300 else -0.5
+                reward += s
+                len_reward += s
                 reward += 0.25 if response.count('</think>') == 1 else -0.25  # 思考闭合分
                 answer = answer.strip()
             if reward_model is not None:
@@ -227,6 +263,7 @@ def calculate_rewards(prompts, completions, gt_batch, tools_batch, num_gen, rewa
                 reward += score  # RM分
             reward -= rep_penalty(answer)
             rewards[idx] = max(min(reward, 3.0), -3.0)  # 总分Clip
+            rewards_wo_len[idx] = max(min(reward - len_reward, 3.0), -3.0)
         # -------- 有工具调用：执行结果奖励 --------
         else:
             gt = gt_batch[sample_idx]
@@ -236,8 +273,15 @@ def calculate_rewards(prompts, completions, gt_batch, tools_batch, num_gen, rewa
                 if isinstance(raw, str):
                     try: raw = json.loads(raw)
                     except: raw = {}
+                # 模型可能直接给出数字/列表等，避免 .get AttributeError
+                if not isinstance(raw, dict):
+                    raw = {}
                 check = CHECK_ARGS.get(name)
-                valid_call_count += int(bool(name in valid_names and check and check(raw)))
+                try:
+                    ok = bool(name in valid_names and check and check(raw))
+                except Exception:
+                    ok = False
+                valid_call_count += int(ok)
             tool_gap = abs(valid_call_count - len(gt)) + max(0, len(tool_calls) - valid_call_count)  # tool数差值
             reward += 0.5 if tool_gap == 0 else -0.5 * tool_gap  # tool对齐分
             
@@ -247,7 +291,8 @@ def calculate_rewards(prompts, completions, gt_batch, tools_batch, num_gen, rewa
             if unfinished: reward -= 0.5  # 未完成扣分
             reward -= rep_penalty(final_text if final_text else answer)
             rewards[idx] = max(min(reward, 3.0), -3.0)  # 总分Clip
-    return rewards
+            rewards_wo_len[idx] = rewards[idx]
+    return rewards, rewards_wo_len
 
 
 def _safe_quantile(x: torch.Tensor, q: float, default: float = 0.0) -> float:
@@ -416,7 +461,17 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
         old_per_token_logps = torch.tensor([old_logps + [0.0] * ((max_len - 1) - len(old_logps)) for _, _, _, old_logps in packed_samples], device=args.device, dtype=torch.float32)
         full_mask = (input_ids != tokenizer.pad_token_id).long()
 
-        rewards = calculate_rewards(prompts, completions, gt_batch, tools_batch, args.num_generations, reward_model, device=args.device, turn_outputs_batch=turn_outputs_batch, unfinished_batch=unfinished_batch)
+        rewards, rewards_wo_len = calculate_rewards(
+            prompts,
+            completions,
+            gt_batch,
+            tools_batch,
+            args.num_generations,
+            reward_model,
+            device=args.device,
+            turn_outputs_batch=turn_outputs_batch,
+            unfinished_batch=unfinished_batch,
+        )
 
         model_unwrapped = model.module if isinstance(model, DistributedDataParallel) else model
         with autocast_ctx:
@@ -485,6 +540,7 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
         if step % args.log_interval == 0 or step == iters:
             pl = loss.item() * args.accumulation_steps
             ar = rewards.mean().item()
+            ar_wo_len = rewards_wo_len.mean().item()
             al = token_counts.float().mean().item()
             kl = ((ref_per_token_logps - per_token_logps) * completion_mask).sum().item() / max(token_counts.sum().item(), 1)
             gs = grouped_rewards.std(dim=1, unbiased=False).mean().item()
@@ -546,6 +602,7 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
                 wandb_payload = {
                     # 原有
                     "reward": ar,
+                    "reward_wo_len": ar_wo_len,
                     "kl_ref": kl,
                     "group_reward_std": gs,
                     "advantages_std": ast,
@@ -603,30 +660,6 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
                     wandb_payload["cuda/mem_allocated_gb"] = torch.cuda.memory_allocated() / (1024 ** 3)
                     wandb_payload["cuda/mem_reserved_gb"] = torch.cuda.memory_reserved() / (1024 ** 3)
 
-                # 样例抽样：每隔 save_interval（或最后一步）记录 best/worst
-                if (step % args.save_interval == 0) or (step == iters):
-                    best_idx = int(torch.argmax(r).item()) if r.numel() else 0
-                    worst_idx = int(torch.argmin(r).item()) if r.numel() else 0
-
-                    def _fmt_sample(idx_):
-                        si = idx_ // args.num_generations if args.num_generations > 0 else 0
-                        prompt_txt = prompts[si] if si < len(prompts) else ""
-                        comp_txt = completions[idx_] if idx_ < len(completions) else ""
-                        gt_ = gt_batch[si] if si < len(gt_batch) else None
-                        unfinished_ = bool(unfinished_batch[idx_]) if unfinished_batch is not None and idx_ < len(unfinished_batch) else False
-                        # 截断避免太大
-                        prompt_txt = prompt_txt[-1500:]
-                        comp_txt = comp_txt[-2000:]
-                        return (
-                            f"reward={r[idx_].item():.4f}, unfinished={unfinished_}\n"
-                            f"gt={gt_}\n"
-                            f"----- prompt (tail) -----\n{prompt_txt}\n"
-                            f"----- completion (tail) -----\n{comp_txt}"
-                        )
-
-                    wandb_payload["samples/best"] = _fmt_sample(best_idx)
-                    wandb_payload["samples/worst"] = _fmt_sample(worst_idx)
-
                 wandb.log(wandb_payload)
 
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
@@ -680,6 +713,7 @@ if __name__ == "__main__":
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE")
     parser.add_argument('--max_seq_len', default=1024, type=int, help="最大序列长度")
     parser.add_argument('--inference_rope_scaling', default=0, type=int, choices=[0, 1], help="rollout/训练时启用YaRN RoPE外推（需policy/ref一致；仅解决位置编码问题）")
+    parser.add_argument('--yarn_target_len', default=5000, type=int, help="YaRN 外推目标长度（用于 factor 计算；同时也用于 RoPE buffer 预计算长度下界）")
     parser.add_argument("--max_gen_len", type=int, default=768, help="单次最大生成长度")
     parser.add_argument("--max_total_len", type=int, default=2500, help="训练侧最终总长度上界")
     parser.add_argument("--data_path", type=str, default="../dataset/agent_rl.jsonl", help="训练数据路径")
@@ -708,12 +742,41 @@ if __name__ == "__main__":
     setup_seed(42 + (dist.get_rank() if dist.is_initialized() else 0))
 
     os.makedirs(args.save_dir, exist_ok=True)
+    # ===== YaRN 配置（按：SFT 默认 768；Agentic RL 训练侧总长度上界 max_total_len） =====
+    # - target_len：用于 RoPE buffer / 外推目标长度。至少覆盖 max_seq_len+max_gen_len，避免越界。
+    # - orig_len：用 SFT 训练时的默认长度 768 作为“原始上下文长度”。
+    cfg_kwargs = {}
+    if bool(args.inference_rope_scaling):
+        # target_len: YaRN 预期外推长度（用于 factor 计算）
+        target_len = max(int(args.yarn_target_len), int(args.max_seq_len + args.max_gen_len))
+        # RoPE buffer 预计算长度：固定给到 32768，避免 rollout/context 偶发变长导致越界
+        rope_buf_len = 32768
+        # YaRN 的 original_max_position_embeddings 更合理的来源：SFT 权重 tag 里的 -Sxxx
+        # 解析不到就回退到默认 768（与 full_sft 默认一致）
+        orig_len = _parse_sft_seq_len_from_weight_name(args.from_weight) or int(SFT_DEFAULT_SEQ_LEN)
+        cfg_kwargs.update(
+            {
+                # 让 RoPE 预计算到 rope_buf_len，避免默认 32768 带来的额外显存/内存占用
+                "max_position_embeddings": rope_buf_len,
+                # 显式覆盖 rope_scaling（MiniMindConfig 支持 kwargs['rope_scaling'] 覆盖）
+                "rope_scaling": {
+                    "type": "yarn",
+                    "factor": float(target_len) / float(orig_len),
+                    "original_max_position_embeddings": orig_len,
+                    "beta_fast": 32.0,
+                    "beta_slow": 1.0,
+                    "attention_factor": 1.0,
+                },
+            }
+        )
+
     lm_config = MiniMindConfig(
         hidden_size=args.hidden_size,
         num_hidden_layers=args.num_hidden_layers,
         max_seq_len=args.max_seq_len + args.max_gen_len,
         use_moe=bool(args.use_moe),
         inference_rope_scaling=bool(args.inference_rope_scaling),
+        **cfg_kwargs,
     )
 
     # ========== run/ckpt 命名（与 pretrain/sft 类似，避免混淆） ==========
@@ -724,10 +787,18 @@ if __name__ == "__main__":
         base_tag = args.save_weight
         run_tag = base_tag
     else:
+        sft_seq_len = _parse_sft_seq_len_from_weight_name(args.from_weight)
+        # 仅当：能解析到，且不是 SFT 默认长度时才加（默认长度不加，避免噪声）
+        sft_len_tag = (
+            f"-SFTS{sft_seq_len}"
+            if (sft_seq_len and int(sft_seq_len) != int(SFT_DEFAULT_SEQ_LEN))
+            else ""
+        )
         base_tag = (
             f"MiniMind-Agent-RL-"
             f"DS{dataset_name}-"
             f"L{args.num_hidden_layers}-H{args.hidden_size}-S{args.max_seq_len}+{args.max_gen_len}"
+            f"{sft_len_tag}"
             f"-MoE{moe_experts}K{moe_topk}-BS{args.batch_size}-GA{args.accumulation_steps}"
             f"-LR{args.learning_rate}-Ep{args.epochs}-G{args.num_generations}"
             f"-B{args.beta}-T{args.loss_type}"
